@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@coretex/organ-boot": "file:../../organ-shared-lib",
+    "express": "^5.1.0",
     "pg": "^8.13.0",
     "pgvector": "^0.2.0"
   }
