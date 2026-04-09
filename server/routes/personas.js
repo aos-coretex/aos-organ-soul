@@ -9,6 +9,7 @@ import { getMemoryPool } from '../db/memory-pool.js';
 import { parseTemplate } from '../../lib/template-parser.js';
 import { mintVivanUrn } from '../../lib/graph-adapter.js';
 import { readFileSync } from 'node:fs';
+import { evaluateEvolution } from '../../agents/evolution-analyst.js';
 
 export function createPersonaRoutes(config) {
   const router = Router();
@@ -238,6 +239,24 @@ export function createPersonaRoutes(config) {
       }
 
       res.json(result.rows[0]);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * POST /personas/:urn/evolve — Trigger manual evolution checkpoint.
+   * Body: { reason: string (optional) }
+   * Returns: evolution result
+   */
+  router.post('/:urn/evolve', async (req, res) => {
+    try {
+      const { urn } = req.params;
+      const result = await evaluateEvolution(urn, config, 'manual');
+      if (result.errors.length > 0 && !result.evolved) {
+        return res.status(400).json(result);
+      }
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
