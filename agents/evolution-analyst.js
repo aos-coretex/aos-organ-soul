@@ -20,6 +20,7 @@
 import { createLLMClient } from '@coretex/organ-boot/llm-client';
 import { getMemoryPool } from '../server/db/memory-pool.js';
 import { getEvolutionPool } from '../server/db/evolution-pool.js';
+import { queryActiveMSP } from '../lib/graph-adapter.js';
 
 const analyst = createLLMClient({
   agentName: 'evolution-analyst',
@@ -30,6 +31,146 @@ const analyst = createLLMClient({
   thinking: true,
   thinkingBudget: 10000,
 });
+
+// --- Constitutional conditioning (2026-04-11 repair, Cortex-role audit Finding 2 YES) ---
+//
+// The evolution analyst is the point where a persona-level declaration is
+// synthesized ("this Vivan will henceforth behave this way"). Without
+// constitutional context, a persona could legitimately evolve in a BoR-
+// contradictory direction that the consistency checker — blind to
+// institutional identity — would classify as growth. Loading MSP + BoR
+// raw text as conditioning context (NOT as a scope oracle) closes the gap.
+// Arbiter retains exclusive scope-ruling authority at Nomos→Arbiter
+// adjudication time; this layer only ensures persona synthesis is aware
+// of the institution the Vivan lives inside.
+
+/**
+ * Fetch the Bill of Rights raw text from Arbiter's HTTP surface.
+ * Fail-open: returns null on any error. Caller treats null as degraded.
+ *
+ * @param {string} arbiterUrl - Arbiter organ base URL
+ * @returns {Promise<string|null>}
+ */
+async function loadBoRRawText(arbiterUrl) {
+  try {
+    const response = await fetch(`${arbiterUrl}/bor/raw`);
+    if (!response.ok) return null;
+    const body = await response.json();
+    return typeof body.raw_text === 'string' && body.raw_text.length > 0
+      ? body.raw_text
+      : null;
+  } catch (error) {
+    process.stdout.write(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: 'bor_load_failed',
+      error: error.message,
+    }) + '\n');
+    return null;
+  }
+}
+
+/**
+ * Load the mission + constitutional frame for persona synthesis.
+ *
+ * @param {string} graphUrl - Graph organ base URL (for active MSP)
+ * @param {string} arbiterUrl - Arbiter organ base URL (for active BoR)
+ * @returns {Promise<{msp: string|null, bor: string|null, degraded: boolean}>}
+ */
+export async function loadConstitutionalFrame(graphUrl, arbiterUrl) {
+  const [msp, bor] = await Promise.all([
+    queryActiveMSP(graphUrl),
+    loadBoRRawText(arbiterUrl),
+  ]);
+  return { msp, bor, degraded: msp === null || bor === null };
+}
+
+/**
+ * Pure prompt builder for persona synthesis. Extracted so tests can
+ * verify prompt structure without invoking the Sonnet client.
+ *
+ * Adds a constitutional frame block to the existing u7h-5 synthesis
+ * prompt. In degraded mode (either MSP or BoR unavailable), injects
+ * a minimal-change posture instruction per MP-11 Senate/Nomos
+ * fail-closed pattern. Never asks Sonnet to make scope rulings —
+ * Arbiter owns IN_SCOPE/OUT_OF_SCOPE/AMBIGUOUS determinations.
+ *
+ * @param {object} currentBaseline - current persona baseline JSON
+ * @param {Array} observations - persona observations
+ * @param {Array<string>} growthDescriptions - growth indicators
+ * @param {{msp: string|null, bor: string|null, degraded: boolean}} constitutionalFrame
+ * @returns {{systemPrompt: string, userMessage: string}}
+ */
+export function buildSynthesisPrompt(currentBaseline, observations, growthDescriptions, constitutionalFrame) {
+  const obsText = observations.map((obs, i) =>
+    `[${i + 1}] (${obs.category}, relevance=${obs.persona_relevance}) ${obs.content}`
+  ).join('\n');
+
+  const growthText = growthDescriptions.length > 0
+    ? `\nGROWTH INDICATORS (from consistency checks):\n${growthDescriptions.map((g) => `- ${g}`).join('\n')}`
+    : '';
+
+  const frame = constitutionalFrame || { msp: null, bor: null, degraded: true };
+
+  const constitutionalBlock = frame.degraded
+    ? `CONSTITUTIONAL FRAME (DEGRADED — institutional identity sources unavailable this cycle):
+The active Mission Statement Protocol and Bill of Rights could not be loaded. Produce a
+persona synthesis that is minimal-change relative to the current baseline; avoid novel
+behavioral additions until constitutional context is recoverable. Prefer stability over
+growth when the institutional frame is missing.`
+    : `CONSTITUTIONAL FRAME (institutional identity and mission — conditioning context only):
+
+ACTIVE MISSION STATEMENT PROTOCOL (MSP):
+${frame.msp}
+
+ACTIVE BILL OF RIGHTS (BoR):
+${frame.bor}
+
+Use the MSP and BoR as conditioning context that shapes the persona update so the evolved
+persona remains an institutionally coherent member of the organism. You are NOT ruling on
+whether any specific behavior is permitted under the BoR — Arbiter owns that determination
+when individual actions are proposed. You are ensuring the synthesized persona is aware of
+the institution it lives inside.`;
+
+  const systemPrompt = `You are Soul's evolution analyst. You update an AI persona's baseline definition
+to incorporate observed growth while preserving core identity and institutional coherence.
+
+CURRENT BASELINE:
+${JSON.stringify(currentBaseline, null, 2)}
+
+${constitutionalBlock}
+
+RULES:
+- PRESERVE core identity: name, fundamental traits, behavioral boundaries
+- INCORPORATE growth: add new traits, refine voice, expand knowledge domains
+- CORRECT drift patterns: strengthen constraints where drift was observed
+- NEVER remove traits or boundaries — only ADD or REFINE
+- REMAIN COHERENT with the institutional identity expressed in the BoR and the mission
+  expressed in the MSP. If a growth indicator would push the persona in a direction that
+  contradicts the constitutional frame, decline that indicator and note the reason in
+  changes_summary.
+- If changes are trivial (cosmetic rewording only), return null
+- The updated baseline must be a complete persona definition (same structure as input)
+
+OUTPUT FORMAT (JSON):
+{
+  "new_baseline": { ... complete baseline_json ... },
+  "changes_summary": "Brief description of what changed and why (1-3 sentences)",
+  "significant": true
+}
+
+If no meaningful evolution is warranted, return:
+{ "new_baseline": null, "changes_summary": "No significant evolution warranted", "significant": false }
+
+Return ONLY the JSON. No wrapping text.`;
+
+  const userMessage = `Based on these ${observations.length} observations and growth indicators, evolve the persona baseline:
+
+OBSERVATIONS:
+${obsText}
+${growthText}`;
+
+  return { systemPrompt, userMessage };
+}
 
 /**
  * Check if a persona qualifies for evolution and execute if so.
@@ -118,10 +259,24 @@ export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manua
     return { evolved: false, new_version: null, reason: 'LLM unavailable', errors: ['ANTHROPIC_API_KEY not set'] };
   }
 
+  // Load constitutional frame (MSP + BoR raw text) before synthesis.
+  // Fail-open: null sources trigger degraded-mode minimal-change posture.
+  const constitutionalFrame = await loadConstitutionalFrame(config.graphUrl, config.arbiterUrl);
+  if (constitutionalFrame.degraded) {
+    process.stdout.write(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: 'constitutional_frame_degraded',
+      vivan: vivanUrn,
+      msp_loaded: constitutionalFrame.msp !== null,
+      bor_loaded: constitutionalFrame.bor !== null,
+    }) + '\n');
+  }
+
   const { newBaseline, changesSummary } = await synthesizeBaseline(
     currentBaseline.baseline_json,
     obsResult.rows,
-    growthDescriptions
+    growthDescriptions,
+    constitutionalFrame
   );
 
   if (!newBaseline) {
@@ -231,53 +386,28 @@ export async function evaluateAllEvolutions(config) {
 
 /**
  * LLM-based baseline synthesis.
- * Incorporates growth indicators into the existing persona definition.
+ * Incorporates growth indicators into the existing persona definition,
+ * conditioned on the institutional identity expressed in the BoR/MSP
+ * (or a minimal-change posture if the constitutional frame is degraded).
+ *
+ * @param {object} currentBaseline
+ * @param {Array} observations
+ * @param {Array<string>} growthDescriptions
+ * @param {{msp: string|null, bor: string|null, degraded: boolean}} [constitutionalFrame]
  */
-async function synthesizeBaseline(currentBaseline, observations, growthDescriptions) {
-  const obsText = observations.map((obs, i) =>
-    `[${i + 1}] (${obs.category}, relevance=${obs.persona_relevance}) ${obs.content}`
-  ).join('\n');
-
-  const growthText = growthDescriptions.length > 0
-    ? `\nGROWTH INDICATORS (from consistency checks):\n${growthDescriptions.map((g, i) => `- ${g}`).join('\n')}`
-    : '';
-
-  const systemPrompt = `You are a persona evolution specialist. You update an AI persona's baseline definition
-to incorporate observed growth while preserving core identity.
-
-CURRENT BASELINE:
-${JSON.stringify(currentBaseline, null, 2)}
-
-RULES:
-- PRESERVE core identity: name, fundamental traits, behavioral boundaries
-- INCORPORATE growth: add new traits, refine voice, expand knowledge domains
-- CORRECT drift patterns: strengthen constraints where drift was observed
-- NEVER remove traits or boundaries — only ADD or REFINE
-- If changes are trivial (cosmetic rewording only), return null
-- The updated baseline must be a complete persona definition (same structure as input)
-
-OUTPUT FORMAT (JSON):
-{
-  "new_baseline": { ... complete baseline_json ... },
-  "changes_summary": "Brief description of what changed and why (1-3 sentences)",
-  "significant": true
-}
-
-If no meaningful evolution is warranted, return:
-{ "new_baseline": null, "changes_summary": "No significant evolution warranted", "significant": false }
-
-Return ONLY the JSON. No wrapping text.`;
-
-  const userMsg = `Based on these ${observations.length} observations and growth indicators, evolve the persona baseline:
-
-OBSERVATIONS:
-${obsText}
-${growthText}`;
+async function synthesizeBaseline(currentBaseline, observations, growthDescriptions, constitutionalFrame) {
+  const frame = constitutionalFrame || { msp: null, bor: null, degraded: true };
+  const { systemPrompt, userMessage } = buildSynthesisPrompt(
+    currentBaseline,
+    observations,
+    growthDescriptions,
+    frame
+  );
 
   try {
     // System prompt via options.system (Anthropic API requirement — RFI-2 fix)
     const result = await analyst.chat([
-      { role: 'user', content: userMsg },
+      { role: 'user', content: userMessage },
     ], { system: systemPrompt, temperature: 0.3 });
 
     const text = result.content.trim();

@@ -14,6 +14,7 @@ export default {
   hippocampusUrl: process.env.HIPPOCAMPUS_URL || (isAOS ? 'http://127.0.0.1:4008' : 'http://127.0.0.1:3908'),
   vectrUrl: process.env.VECTR_URL || (isAOS ? 'http://127.0.0.1:4001' : 'http://127.0.0.1:3901'),
   graphUrl: process.env.GRAPH_URL || (isAOS ? 'http://127.0.0.1:4020' : 'http://127.0.0.1:3920'),
+  arbiterUrl: process.env.ARBITER_URL || (isAOS ? 'http://127.0.0.1:4021' : 'http://127.0.0.1:3921'),
   env,
 
   // Soul-specific
