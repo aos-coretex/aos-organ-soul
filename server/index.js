@@ -16,6 +16,7 @@ import { createPersonaRoutes } from './routes/personas.js';
 import { createAnalysisRoutes } from './routes/analysis.js';
 import { handleDirectedMessage } from './handlers/spine-commands.js';
 import { onConversationCompleted, onSessionEnd } from '../agents/behavioral-observer.js';
+import { getDegradedStreak } from '../agents/evolution-analyst.js';
 import { isVectrAvailable } from '../lib/vectr-client.js';
 
 let spineRef = null;
@@ -162,6 +163,8 @@ const organ = await createOrgan({
       dream_enabled: config.dreamEnabled,
       thresholds: config.thresholds,
       evolution_config: config.evolution,
+      // C2A-03: consecutive dream cycles with degraded constitutional frame
+      constitutional_frame_degraded_streak: getDegradedStreak(),
     };
   },
 

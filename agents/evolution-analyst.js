@@ -32,6 +32,32 @@ const analyst = createLLMClient({
   thinkingBudget: 10000,
 });
 
+// --- C2A-03: degraded-streak tracking (dream-cycle granularity) ---
+//
+// Tracks consecutive dream cycles where the constitutional frame is degraded.
+// Incremented once per dream cycle (in evaluateAllEvolutions), not per-persona.
+// Reset to 0 when a non-degraded cycle completes. Exposed via /introspect so
+// Vigil can assert the streak stays below threshold.
+
+let degradedStreak = 0;
+let lastDegradedAt = null;
+
+/**
+ * Read the current degraded-cycle streak. Consumed by introspectCheck.
+ * @returns {{ streak: number, last_degraded_at: string|null }}
+ */
+export function getDegradedStreak() {
+  return { streak: degradedStreak, last_degraded_at: lastDegradedAt };
+}
+
+/**
+ * Reset streak to zero. Exported for test isolation only.
+ */
+export function resetDegradedStreak() {
+  degradedStreak = 0;
+  lastDegradedAt = null;
+}
+
 // --- Constitutional conditioning (2026-04-11 repair, Cortex-role audit Finding 2 YES) ---
 //
 // The evolution analyst is the point where a persona-level declaration is
@@ -177,9 +203,13 @@ ${growthText}`;
  * @param {string} vivanUrn
  * @param {object} config — Soul config (evolution thresholds)
  * @param {string} triggerSource — 'dream_cycle' | 'manual' | 'threshold'
+ * @param {{msp: string|null, bor: string|null, degraded: boolean}} [preloadedFrame]
+ *   Optional pre-loaded constitutional frame. When called from evaluateAllEvolutions(),
+ *   the frame is loaded once per dream cycle and passed to all persona evaluations.
+ *   Manual triggers load their own frame.
  * @returns {Promise<{evolved: boolean, new_version: number|null, reason: string, errors: string[]}>}
  */
-export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manual') {
+export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manual', preloadedFrame = null) {
   const errors = [];
 
   // 1. Load current state from soul_evolution
@@ -261,7 +291,8 @@ export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manua
 
   // Load constitutional frame (MSP + BoR raw text) before synthesis.
   // Fail-open: null sources trigger degraded-mode minimal-change posture.
-  const constitutionalFrame = await loadConstitutionalFrame(config.graphUrl, config.arbiterUrl);
+  // C2A-03: when called from evaluateAllEvolutions(), frame is pre-loaded once per cycle.
+  const constitutionalFrame = preloadedFrame || await loadConstitutionalFrame(config.graphUrl, config.arbiterUrl);
   if (constitutionalFrame.degraded) {
     process.stdout.write(JSON.stringify({
       timestamp: new Date().toISOString(),
@@ -357,8 +388,13 @@ export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manua
 /**
  * Evaluate all active personas for evolution eligibility.
  * Called by dream cycle (Relay 6).
+ *
+ * C2A-03: loads the constitutional frame ONCE per dream cycle, updates the
+ * degraded streak, and passes the frame to each persona evaluation. This
+ * ensures the streak tracks consecutive dream cycles, not per-persona calls.
+ *
  * @param {object} config
- * @returns {Promise<{evaluated: number, evolved: number, skipped: number, errors: string[]}>}
+ * @returns {Promise<{evaluated: number, evolved: number, skipped: number, constitutional_frame_degraded: boolean, degraded_streak: number, errors: string[]}>}
  */
 export async function evaluateAllEvolutions(config) {
   const evoPool = getEvolutionPool();
@@ -366,11 +402,35 @@ export async function evaluateAllEvolutions(config) {
     "SELECT vivan_urn FROM persona_registry WHERE status = 'active'"
   );
 
+  // C2A-03: load constitutional frame once per dream cycle for streak tracking.
+  const constitutionalFrame = await loadConstitutionalFrame(config.graphUrl, config.arbiterUrl);
+
+  if (constitutionalFrame.degraded) {
+    degradedStreak += 1;
+    lastDegradedAt = new Date().toISOString();
+    process.stdout.write(JSON.stringify({
+      timestamp: lastDegradedAt,
+      event: 'constitutional_frame_degraded_streak',
+      streak: degradedStreak,
+      msp_loaded: constitutionalFrame.msp !== null,
+      bor_loaded: constitutionalFrame.bor !== null,
+    }) + '\n');
+  } else {
+    if (degradedStreak > 0) {
+      process.stdout.write(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: 'constitutional_frame_degraded_streak_reset',
+        previous_streak: degradedStreak,
+      }) + '\n');
+    }
+    degradedStreak = 0;
+  }
+
   let evolved = 0, skipped = 0;
   const allErrors = [];
 
   for (const row of result.rows) {
-    const evoResult = await evaluateEvolution(row.vivan_urn, config, 'dream_cycle');
+    const evoResult = await evaluateEvolution(row.vivan_urn, config, 'dream_cycle', constitutionalFrame);
     if (evoResult.evolved) evolved++;
     else skipped++;
     allErrors.push(...evoResult.errors);
@@ -380,6 +440,8 @@ export async function evaluateAllEvolutions(config) {
     evaluated: result.rows.length,
     evolved,
     skipped,
+    constitutional_frame_degraded: constitutionalFrame.degraded,
+    degraded_streak: degradedStreak,
     errors: allErrors,
   };
 }
