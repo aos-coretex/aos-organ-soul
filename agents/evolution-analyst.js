@@ -17,20 +17,27 @@
  * Note: thinking config set for intent documentation. Current llm-client
  * does not propagate client config to chat() options. Same note as u7h-4.
  */
-import { createLLMClient } from '@coretex/organ-boot/llm-client';
+import { resolveCascade } from '@coretex/organ-boot/statute-cascade';
 import { getMemoryPool } from '../server/db/memory-pool.js';
 import { getEvolutionPool } from '../server/db/evolution-pool.js';
-import { queryActiveMSP } from '../lib/graph-adapter.js';
+import { queryActiveMSP, createSoulGraphClient } from '../lib/graph-adapter.js';
 
-const analyst = createLLMClient({
-  agentName: 'evolution-analyst',
-  defaultModel: 'claude-sonnet-4-6',
-  defaultProvider: 'anthropic',
-  apiKeyEnvVar: 'ANTHROPIC_API_KEY',
-  maxTokens: 4096,
-  thinking: true,
-  thinkingBudget: 10000,
-});
+// MP-CONFIG-1 R7 — loader-derived LLM client (Sonnet + thinking budget 10000 per D9)
+// injected at boot via setLLMClient(). Unavailable-stub default preserves test imports
+// that don't exercise the LLM path.
+let analyst = {
+  isAvailable: () => false,
+  chat: async () => {
+    const err = new Error('Soul evolution-analyst: no LLM client wired; boot path must inject one (MP-CONFIG-1 R7)');
+    err.code = 'LLM_UNAVAILABLE';
+    throw err;
+  },
+  getUsage: () => ({}),
+};
+
+export function setLLMClient(client) {
+  analyst = client;
+}
 
 // --- C2A-03: degraded-streak tracking (dream-cycle granularity) ---
 //
@@ -110,6 +117,57 @@ export async function loadConstitutionalFrame(graphUrl, arbiterUrl) {
   return { msp, bor, degraded: msp === null || bor === null };
 }
 
+// --- Statute cascade (MP-17 relay g7c-8) ------------------------------------
+//
+// The evolution analyst resolves a per-Vivan statute cascade in addition to
+// the cycle-level MSP+BoR frame. The cascade (Constitution → category →
+// domain → role → persona overrides) supplies structured `effectiveGovernance`
+// that conditions persona synthesis against role-specific constraints.
+//
+// Soul is a CONSUMER of this cascade — not an author. Governance authorship
+// lives in Senate (#10). Soul's only writes here are diagnostic: the resolved
+// layers-applied are recorded on each evolution_event for transparency.
+//
+// Failure mode: fail-open. If cascade resolution throws (Graph unreachable,
+// GraphIntegrityError, etc.) the cascade is reported as `unavailable: true`
+// with empty effective governance, and the prompt falls back to the cycle
+// frame. This preserves the existing constitutional-conditioning behavior.
+
+/**
+ * Load the statute cascade for a specific Vivan. Fail-open on any error —
+ * callers treat `unavailable: true` as "no structured cascade this cycle".
+ *
+ * @param {string} graphUrl
+ * @param {string} vivanUrn
+ * @returns {Promise<{effectiveGovernance: object, layersApplied: Array<{layer:string,urn:string}>, constitutionFieldsLocked: string[], unavailable: boolean}>}
+ */
+export async function loadStatuteCascade(graphUrl, vivanUrn) {
+  try {
+    const graphClient = createSoulGraphClient(graphUrl);
+    const resolved = await resolveCascade({ personaUrn: vivanUrn, graphClient });
+    return {
+      effectiveGovernance: resolved.effectiveGovernance || {},
+      layersApplied: resolved.layersApplied || [],
+      constitutionFieldsLocked: resolved.constitutionFieldsLocked || [],
+      unavailable: false,
+    };
+  } catch (error) {
+    process.stdout.write(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: 'statute_cascade_unavailable',
+      vivan: vivanUrn,
+      error: error.message,
+      error_name: error.name || 'Error',
+    }) + '\n');
+    return {
+      effectiveGovernance: {},
+      layersApplied: [],
+      constitutionFieldsLocked: [],
+      unavailable: true,
+    };
+  }
+}
+
 /**
  * Pure prompt builder for persona synthesis. Extracted so tests can
  * verify prompt structure without invoking the Sonnet client.
@@ -157,13 +215,60 @@ whether any specific behavior is permitted under the BoR — Arbiter owns that d
 when individual actions are proposed. You are ensuring the synthesized persona is aware of
 the institution it lives inside.`;
 
+  // Optional per-Vivan statute cascade block (MP-17 relay g7c-8).
+  // Only rendered when a cascade has been resolved; absent on cascade-
+  // unavailable or when the caller passes a frame without cascade fields
+  // (backward compatibility with pre-g7c-8 callers).
+  const layers = Array.isArray(frame.layersApplied) ? frame.layersApplied : [];
+  const effectiveGov = (frame.effectiveGovernance && typeof frame.effectiveGovernance === 'object')
+    ? frame.effectiveGovernance
+    : {};
+  const lockedFields = Array.isArray(frame.constitutionFieldsLocked) ? frame.constitutionFieldsLocked : [];
+
+  let cascadeBlock = '';
+  if (frame.cascadeUnavailable === true) {
+    cascadeBlock = `
+STATUTE CASCADE (UNAVAILABLE — per-Vivan governance chain could not be resolved):
+No role/domain/category statutes or persona overrides could be loaded for this Vivan this
+cycle. Fall back to the Constitutional Frame above; do not infer statute content.`;
+  } else if (layers.length > 0) {
+    const layersList = layers.map((l) => `- ${l.layer}: ${l.urn}`).join('\n');
+    const govEntries = Object.entries(effectiveGov);
+    const govList = govEntries.length > 0
+      ? govEntries.map(([field, value]) => `- ${field}: ${JSON.stringify(value)}`).join('\n')
+      : '- (no constraint fields — cascade layers present but empty constraints)';
+    const lockedList = lockedFields.length > 0
+      ? lockedFields.map((f) => `- ${f}`).join('\n')
+      : '- (none)';
+    cascadeBlock = `
+STATUTE CASCADE (per-Vivan governance — structured conditioning context):
+
+LAYERS APPLIED (general → specific):
+${layersList}
+
+EFFECTIVE GOVERNANCE (merged, more-specific-wins, Constitution locks):
+${govList}
+
+CONSTITUTION-LOCKED FIELDS (no lower layer may override):
+${lockedList}
+
+Use the EFFECTIVE GOVERNANCE fields as structured constraint conditioning:
+- DRIFT: any growth indicator that would push the persona to violate an effective
+  governance value is DRIFT. Decline such indicators and note the violated field and the
+  governing layer in changes_summary (e.g. "declined X — violates role.max_concurrent_tasks").
+- GROWTH: growth indicators that expand capability within the effective governance
+  boundaries are candidates for incorporation.
+You are NOT issuing adjudications — Nomos/Arbiter own that at enforcement time. This is
+conditioning context for persona synthesis only.`;
+  }
+
   const systemPrompt = `You are Soul's evolution analyst. You update an AI persona's baseline definition
 to incorporate observed growth while preserving core identity and institutional coherence.
 
 CURRENT BASELINE:
 ${JSON.stringify(currentBaseline, null, 2)}
 
-${constitutionalBlock}
+${constitutionalBlock}${cascadeBlock}
 
 RULES:
 - PRESERVE core identity: name, fundamental traits, behavioral boundaries
@@ -303,11 +408,23 @@ export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manua
     }) + '\n');
   }
 
+  // MP-17 g7c-8: resolve per-Vivan statute cascade. Separate from the cycle
+  // frame because the cascade is per-Vivan; the MSP/BoR frame is cycle-level.
+  // Fail-open: cascadeUnavailable=true preserves existing analyst behavior.
+  const cascade = await loadStatuteCascade(config.graphUrl, vivanUrn);
+  const fullFrame = {
+    ...constitutionalFrame,
+    effectiveGovernance: cascade.effectiveGovernance,
+    layersApplied: cascade.layersApplied,
+    constitutionFieldsLocked: cascade.constitutionFieldsLocked,
+    cascadeUnavailable: cascade.unavailable,
+  };
+
   const { newBaseline, changesSummary } = await synthesizeBaseline(
     currentBaseline.baseline_json,
     obsResult.rows,
     growthDescriptions,
-    constitutionalFrame
+    fullFrame
   );
 
   if (!newBaseline) {
@@ -339,7 +456,21 @@ export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manua
       WHERE vivan_urn = $2
     `, [newVersion, vivanUrn]);
 
-    // Record evolution event (audit trail)
+    // Record evolution event (audit trail). MP-17 g7c-8: evidence_refs now
+    // carries an object with both the observation list and the resolved
+    // statute cascade layers applied — diagnostic transparency for which
+    // layer of governance most governs the synthesized change. JSONB column;
+    // no DDL change. Readers accepting either shape (array or object) is a
+    // non-concern: this relay's search found no consumers of evidence_refs
+    // outside this writer.
+    const evidenceRefsPayload = {
+      observations: obsResult.rows.slice(0, 20).map((o) => ({
+        observation_id: o.id,
+        content_summary: o.content.slice(0, 100),
+      })),
+      effective_governance_layers_applied: cascade.layersApplied,
+      cascade_unavailable: cascade.unavailable,
+    };
     await client.query(`
       INSERT INTO evolution_events
         (vivan_urn, from_version, to_version, trigger_source, reason, evidence_refs,
@@ -351,9 +482,7 @@ export async function evaluateEvolution(vivanUrn, config, triggerSource = 'manua
       newVersion,
       triggerSource,
       changesSummary,
-      JSON.stringify(
-        obsResult.rows.slice(0, 20).map(o => ({ observation_id: o.id, content_summary: o.content.slice(0, 100) }))
-      ),
+      JSON.stringify(evidenceRefsPayload),
       registry.last_consistency_score,
     ]);
 

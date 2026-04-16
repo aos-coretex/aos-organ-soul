@@ -15,7 +15,6 @@
  *   2. System prompt via options.system (not messages array)
  *   3. persona_urn via conversation.participants?.persona_urn
  */
-import { createLLMClient } from '@coretex/organ-boot/llm-client';
 import { getMemoryPool } from '../server/db/memory-pool.js';
 import { getEvolutionPool } from '../server/db/evolution-pool.js';
 import { fetchConversation, fetchSessionConversations } from '../lib/hippocampus-client.js';
@@ -23,13 +22,21 @@ import { generateEmbedding } from '../lib/vectr-client.js';
 
 const CATEGORIES = ['PREFERENCE', 'TRAIT', 'PATTERN', 'MOTIVATION', 'PREDICTION'];
 
-const observer = createLLMClient({
-  agentName: 'behavioral-observer',
-  defaultModel: 'claude-haiku-4-5-20251001',
-  defaultProvider: 'anthropic',
-  apiKeyEnvVar: 'ANTHROPIC_API_KEY',
-  maxTokens: 2048,
-});
+// MP-CONFIG-1 R7 — loader-derived LLM client injected at boot via setLLMClient().
+// Unavailable-stub default preserves test imports that don't exercise the LLM path.
+let observer = {
+  isAvailable: () => false,
+  chat: async () => {
+    const err = new Error('Soul behavioral-observer: no LLM client wired; boot path must inject one (MP-CONFIG-1 R7)');
+    err.code = 'LLM_UNAVAILABLE';
+    throw err;
+  },
+  getUsage: () => ({}),
+};
+
+export function setLLMClient(client) {
+  observer = client;
+}
 
 /**
  * Process a conversation_completed trigger.

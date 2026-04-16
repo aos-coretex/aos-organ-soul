@@ -8,6 +8,8 @@
  * Internal agents: behavioral observer, consistency checker, evolution analyst, dream cycle
  */
 import { createOrgan } from '@coretex/organ-boot';
+import { createLoader } from '@coretex/organ-boot/llm-settings-loader';
+import { initializeUsageAttribution } from '@coretex/organ-boot/usage-attribution';
 import config from './config.js';
 import { initMemoryPool, closeMemoryPool, getMemoryPool } from './db/memory-pool.js';
 import { initEvolutionPool, closeEvolutionPool, getEvolutionPool } from './db/evolution-pool.js';
@@ -15,8 +17,16 @@ import { verifySchema } from './db/schema.js';
 import { createPersonaRoutes } from './routes/personas.js';
 import { createAnalysisRoutes } from './routes/analysis.js';
 import { handleDirectedMessage } from './handlers/spine-commands.js';
-import { onConversationCompleted, onSessionEnd } from '../agents/behavioral-observer.js';
-import { getDegradedStreak } from '../agents/evolution-analyst.js';
+import {
+  onConversationCompleted,
+  onSessionEnd,
+  setLLMClient as setObserverLLM,
+} from '../agents/behavioral-observer.js';
+import { setLLMClient as setCheckerLLM } from '../agents/consistency-checker.js';
+import {
+  getDegradedStreak,
+  setLLMClient as setAnalystLLM,
+} from '../agents/evolution-analyst.js';
 import { isVectrAvailable } from '../lib/vectr-client.js';
 
 let spineRef = null;
@@ -25,6 +35,31 @@ let spineRef = null;
 const memStats = await initMemoryPool();
 const evoStats = await initEvolutionPool();
 await verifySchema();
+
+// --- LLM settings loader (MP-CONFIG-1 R7 migration — l9m-7) ---
+
+const llmLoader = createLoader({
+  organNumber: 90,
+  organName: 'soul',
+  settingsRoot: config.settingsRoot,
+});
+
+// MP-CONFIG-1 R9 — register the process-default usage writer.
+initializeUsageAttribution({ organName: 'Soul', graphUrl: config.graphUrl });
+
+function buildLlmClient(agentName) {
+  const { config: resolved, chat } = llmLoader.resolveWithCascade(agentName);
+  const apiKeyEnv = resolved.apiKeyEnvVar || 'ANTHROPIC_API_KEY';
+  return {
+    chat,
+    isAvailable: () => Boolean(process.env[apiKeyEnv]),
+    getUsage: () => ({ agent: resolved.agentName, model: resolved.defaultModel, provider: resolved.defaultProvider }),
+  };
+}
+
+setObserverLLM(buildLlmClient('behavioral-observer'));
+setCheckerLLM(buildLlmClient('consistency-checker'));
+setAnalystLLM(buildLlmClient('evolution-analyst'));
 
 const services = { config };
 
@@ -165,6 +200,8 @@ const organ = await createOrgan({
       evolution_config: config.evolution,
       // C2A-03: consecutive dream cycles with degraded constitutional frame
       constitutional_frame_degraded_streak: getDegradedStreak(),
+      // MP-CONFIG-1 R7 — flat per bug #9; consumed by Axon aggregator R8.
+      llm: llmLoader.introspect(),
     };
   },
 

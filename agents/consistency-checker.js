@@ -18,19 +18,25 @@
  * llm-client is upgraded, thinking/temperature conflict must be resolved
  * (Anthropic API requires temperature omitted when thinking is enabled).
  */
-import { createLLMClient } from '@coretex/organ-boot/llm-client';
 import { getMemoryPool } from '../server/db/memory-pool.js';
 import { getEvolutionPool } from '../server/db/evolution-pool.js';
 
-const checker = createLLMClient({
-  agentName: 'consistency-checker',
-  defaultModel: 'claude-sonnet-4-6',
-  defaultProvider: 'anthropic',
-  apiKeyEnvVar: 'ANTHROPIC_API_KEY',
-  maxTokens: 4096,
-  thinking: true,
-  thinkingBudget: 8000,
-});
+// MP-CONFIG-1 R7 — loader-derived LLM client (Sonnet + thinking budget 8000 per D9)
+// injected at boot via setLLMClient(). Unavailable-stub default preserves test imports
+// that don't exercise the LLM path.
+let checker = {
+  isAvailable: () => false,
+  chat: async () => {
+    const err = new Error('Soul consistency-checker: no LLM client wired; boot path must inject one (MP-CONFIG-1 R7)');
+    err.code = 'LLM_UNAVAILABLE';
+    throw err;
+  },
+  getUsage: () => ({}),
+};
+
+export function setLLMClient(client) {
+  checker = client;
+}
 
 /**
  * Run consistency check for a single Vivan.

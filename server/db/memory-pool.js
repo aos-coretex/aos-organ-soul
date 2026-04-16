@@ -26,12 +26,11 @@ export function getMemoryPool() {
 export async function initMemoryPool() {
   const p = getMemoryPool();
 
-  // Register pgvector type handler
-  await pgvector.registerTypes(p);
-
   // Verify connectivity and schema
   const client = await p.connect();
   try {
+    // Register pgvector type handler (requires Client, not Pool)
+    await pgvector.registerTypes(client);
     const tableCheck = await client.query(`
       SELECT table_name FROM information_schema.tables
       WHERE table_schema = 'public'

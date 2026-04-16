@@ -6,6 +6,9 @@
 const env = process.env.NODE_ENV || 'development';
 const isAOS = env !== 'production';
 
+const vaultRoot = process.env.VAULT_ROOT
+  || '/Library/AI/AI-Infra-MDvaults/MDvault-LLM-Ops';
+
 export default {
   name: 'Soul',
   port: parseInt(process.env.SOUL_PORT || (isAOS ? '4009' : '3909'), 10),
@@ -36,4 +39,7 @@ export default {
 
   // Observation categories (Soul's own taxonomy — NOT Minder's levels)
   categories: ['PREFERENCE', 'TRAIT', 'PATTERN', 'MOTIVATION', 'PREDICTION'],
+
+  vaultRoot,
+  settingsRoot: process.env.SETTINGS_ROOT || `${vaultRoot}/01-Organs`,
 };
